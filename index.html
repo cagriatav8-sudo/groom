@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>G Room Online</title>
+    <!-- Tailwind CSS ve FontAwesome İkonları -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Jitsi Meet Görüntülü Konuşma Kütüphanesi -->
+    <script src="https://meet.jit.si/external_api.js"></script>
+    
+    <!-- Firebase Modülleri -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-app.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit, doc, deleteDoc, setDoc, getDoc } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
+
+        // Senin Firebase Bilgilerin
+        const firebaseConfig = {
+            apiKey: "AIzaSyBnp-h0od-8NUJwLUpBq0WoY5uI28I-Ja8",
+            authDomain: "g-room-708ce.firebaseapp.com",
+            projectId: "g-room-708ce",
+            storageBucket: "g-room-708ce.firebasestorage.app",
+            messagingSenderId: "245753698677",
+            appId: "1:245753698677:web:dee50a47d9c4e497369b3c",
+            measurementId: "G-N6PFW760PZ"
+        };
+
+        // Firebase Başlatma
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+
+        // Değişkenler
+        let currentUser = localStorage.getItem('groom_username') || '';
+        let spamCounter = { lastMsg: '', count: 0 };
+        let activeBanListener = null;
+        let jitsiApi = null;
+        
+        // Ses Kayıt Değişkenleri
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let isRecording = false;
+
+        // Discord Bildirim Sesi
+        const discordSound = new Audio('https://assets.mixkit.co/active_storage/sfx/2357/2357-84.wav');
+
+        window.addEventListener('DOMContentLoaded', () => {
+            const loginModal = document.getElementById('loginModal');
+            const settingsModal = document.getElementById('settingsModal');
+            const adminModal = document.getElementById('adminModal');
+            const messagesDiv = document.getElementById('messages');
+            const messageInput = document.getElementById('messageInput');
+            const usernameInput = document.getElementById('usernameInput');
+            const recordBtn = document.getElementById('recordBtn');
+            const recordStatus = document.getElementById('recordStatus');
+
+            // Giriş Kontrolü
+            if (!currentUser) {
+                loginModal.classList.remove('hidden');
+            } else {
+                startApp();
+            }
+
+            // Uygulamayı Başlat
+            function startApp() {
+                checkBanStatus();
+                listenBanStatus(currentUser);
+                loadMessages();
+                listenDiscordCalls();
+                listenActiveCall();
+            }
+
+            // Giriş Yapma ve İsim Belirleme
+            window.joinChat = async () => {
+                const name = usernameInput.value.trim();
+                if (!name) return alert("Lütfen bir isim girin!");
+
+                try {
+                    const userRef = doc(db, "active_users", name);
+                    const userDoc = await getDoc(userRef);
+
+                    if (userDoc.exists()) {
+                        return alert("Bu kullanıcı adı şu an aktif olarak kullanılıyor! Başka bir ad seçin.");
+                    }
+
+                    await setDoc(userRef, { active: true });
+                    
+                    localStorage.setItem('groom_username', name);
+                    currentUser = name;
+                    loginModal.classList.add('hidden');
+                    startApp();
+                } catch (err) {
+                    console.error("Giriş hatası:", err);
+                    alert("Veritabanı bağlantı hatası!");
+                }
+            };
+
+            // Sekme kapanırken ismi havuzdan temizle
+            window.addEventListener('beforeunload', async () => {
+                if (currentUser) {
+                    await deleteDoc(doc(db, "active_users", currentUser));
+                }
+            });
+
+            // Ban Durumu Kontrolü
+            function checkBanStatus() {
+                const banExpiry = localStorage.getItem('groom_ban_expiry');
+                if (banExpiry) {
+                    if (banExpiry === 'infinite') {
+                        showBanScreen("G Room'dan SINIRSIZ uzaklaştırıldınız!");
+                        return true;
+                    }
+                    const expiryTime = parseInt(banExpiry);
+                    if (Date.now() < expiryTime) {
+                        const remaining = Math.round((expiryTime - Date.now()) / 1000 / 60);
+                        showBanScreen(`Spam nedeniyle cezalandırıldınız! Kalan süre: ${remaining} dakika`);
+                        return true;
+                    } else {
+                        localStorage.removeItem('groom_ban_expiry');
+                    }
+                }
+                return false;
+            }
+
+            // Canlı Ban Dinleme
+            function listenBanStatus(username) {
+                if (activeBanListener) activeBanListener();
+
+                activeBanListener = onSnapshot(doc(db, "bans", username), (docSnap) => {
+                    if (docSnap.exists()) {
+                        const banData = docSnap.data();
+                        localStorage.setItem('groom_ban_expiry', banData.expiry);
+                        checkBanStatus();
+                    } else {
+                        localStorage.removeItem('groom_ban_expiry');
+                    }
+                });
+            }
+
+            function showBanScreen(message) {
+                document.body.innerHTML = `
+                    <div class="h-screen w-screen flex flex-col justify-center items-center bg-gray-900 text-white p-4">
+                        <i class="fa-solid fa-ban text-red-500 text-7xl mb-4 animate-pulse"></i>
+                        <h1 class="text-3xl font-bold text-center">${message}</h1>
+                        <p class="text-gray-400 mt-2">G Room Online kurallarına uymadığınız için işlem yapılmıştır.</p>
+                    </div>`;
+            }
+
+            // Canlı Mesajları Yükle
+            function loadMessages() {
+                const q = query(collection(db, "messages"), orderBy("timestamp", "asc"), limit(100));
+                onSnapshot(q, (snapshot) => {
+                    messagesDiv.innerHTML = '';
+                    snapshot.forEach((doc) => {
+                        const data = doc.data();
+                        const isMe = data.sender === currentUser;
+                        createMessageHTML(doc.id, data, isMe);
+                    });
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                }, (error) => {
+                    console.error("Yükleme hatası:", error);
+                });
+            }
+
+            // Mesaj Tasarımı Oluştur
+            function createMessageHTML(id, data, isMe) {
+                if (data.type === 'discord_call') return;
+
+                const msgBox = document.createElement('div');
+                msgBox.className = `flex flex-col mb-4 ${isMe ? 'items-end' : 'items-start'}`;
+                
+                let contentHTML = '';
+                if (data.type === 'text') {
+                    contentHTML = `<p class="break-words text-sm">${data.content}</p>`;
+                } else if (data.type === 'image' || data.type === 'gif') {
+                    contentHTML = `<img src="${data.content}" class="max-w-[200px] rounded-lg mt-1 cursor-pointer hover:scale-105 transition" onclick="window.open('${data.content}')" />`;
+                } else if (data.type === 'video') {
+                    contentHTML = `<video src="${data.content}" controls class="max-w-[200px] rounded-lg mt-1"></video>`;
+                } else if (data.type === 'audio') {
+                    contentHTML = `<audio src="${data.content}" controls class="max-w-[240px] mt-1 accent-green-500"></audio>`;
+                }
+
+                const deleteButtonHTML = isMe 
+                    ? `<button onclick="deleteMessage('${id}', '${data.sender}')" class="absolute -top-2 -right-2 bg-red-600 text-white text-xs w-5 h-5 rounded-full hidden group-hover:flex items-center justify-center hover:bg-red-700 transition shadow-md">
+                            <i class="fa-solid fa-trash text-[10px]"></i>
+                       </button>` 
+                    : '';
+
+                msgBox.innerHTML = `
+                    <div class="max-w-[70%] text-white rounded-2xl px-4 py-2 relative group shadow-lg ${isMe ? 'rounded-tr-none bg-blue-600' : 'rounded-tl-none bg-gray-700'}">
+                        <span class="text-xs font-bold text-gray-300 block mb-1">${data.sender}</span>
+                        ${contentHTML}
+                        ${deleteButtonHTML}
+                    </div>
+                    <span class="text-[10px] text-gray-500 mt-1 px-2">${new Date(data.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                `;
+                messagesDiv.appendChild(msgBox);
+            }
+
+            // Mesaj Gönderme ve Spam Koruması
+            window.sendMessage = async (type = 'text', content = null) => {
+                if (checkBanStatus()) return;
+
+                const text = content || messageInput.value.trim();
+                if (!text && type === 'text') return;
+
+                if (type === 'text') {
+                    if (text === spamCounter.lastMsg) {
+                        spamCounter.count++;
+                        if (spamCounter.count >= 10) {
+                            const banTime = (Date.now() + 30 * 60 * 1000).toString();
+                            localStorage.setItem('groom_ban_expiry', banTime);
+                            await setDoc(doc(db, "bans", currentUser), { expiry: banTime });
+                            alert("Spam yaptığın için 30 dakika süreyle banlandın!");
+                            return;
+                        }
+                    } else {
+                        spamCounter.lastMsg = text;
+                        spamCounter.count = 1;
+                    }
+                }
+
+                await addDoc(collection(db, "messages"), {
+                    sender: currentUser,
+                    type: type,
+                    content: text,
+                    timestamp: Date.now()
+                });
+                messageInput.value = '';
+            };
+
+            // Ses Kaydetme Fonksiyonları
+            window.toggleAudioRecording = async () => {
+                if (checkBanStatus()) return;
+
+                if (!isRecording) {
+                    try {
+                        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                        mediaRecorder = new MediaRecorder(stream);
+                        audioChunks = [];
+
+                        mediaRecorder.ondataavailable = (event) => {
+                            audioChunks.push(event.data);
+                        };
+
+                        mediaRecorder.onstop = () => {
+                            const audioBlob = new Blob(audioChunks, { type: 'audio/mp3' });
+                            const reader = new FileReader();
+                            reader.onloadend = () => {
+                                const base64Audio = reader.result;
+                                sendMessage('audio', base64Audio);
+                            };
+                            reader.readAsDataURL(audioBlob);
+                            stream.getTracks().forEach(track => track.stop());
+                        };
+
+                        mediaRecorder.start();
+                        isRecording = true;
+                        recordBtn.classList.replace('bg-emerald-600', 'bg-red-600');
+                        recordBtn.innerHTML = '<i class="fa-solid fa-square text-lg"></i>';
+                        recordStatus.classList.remove('hidden');
+                    } catch (err) {
+                        alert("Mikrofon izni verilmedi veya cihaz bulunamadı!");
+                        console.error(err);
+                    }
+                } else {
+                    mediaRecorder.stop();
+                    isRecording = false;
+                    recordBtn.classList.replace('bg-red-600', 'bg-emerald-600');
+                    recordBtn.innerHTML = '<i class="fa-solid fa-microphone text-lg"></i>';
+                    recordStatus.classList.add('hidden');
+                }
+            };
+
+            // Sadece Kendi Mesajını Silme Kontrolü
+            window.deleteMessage = async (id, sender) => {
+                if (sender !== currentUser) {
+                    return alert("Yalnızca kendi gönderdiğiniz mesajları silebilirsiniz!");
+                }
+                if (confirm("Bu mesajı herkesten silmek istiyor musunuz?")) {
+                    await deleteDoc(doc(db, "messages", id));
+                }
+            };
+
+            // Discord Çağrı Sistemi (Tüm Online Kullanıcıları Uyarır)
+            window.sendDiscordCall = async () => {
+                if (checkBanStatus()) return;
+                
+                if (confirm("Sohbetteki herkesi Discord ses kanalına çağırmak istiyor musunuz?")) {
+                    await addDoc(collection(db, "messages"), {
+                        sender: currentUser,
+                        type: "discord_call",
+                        content: `${currentUser} herkesi Discord ses kanalına çağırıyor!`,
+                        timestamp: Date.now()
+                    });
+                    alert("Discord çağrısı başarıyla gönderildi!");
+                }
+            };
+
+            // Canlı Discord Çağrılarını Dinleme
+            function listenDiscordCalls() {
+                const q = query(collection(db, "messages"), orderBy("timestamp", "desc"), limit(1));
+                onSnapshot(q, (snapshot) => {
+                    snapshot.forEach((doc) => {
+                        const data = doc.data();
+                        if (data.type === 'discord_call' && data.sender !== currentUser && (Date.now() - data.timestamp) < 5000) {
+                            try {
+                                discordSound.play();
+                            } catch(e) { console.log("Ses çalma engeli."); }
+                            
+                            alert(`🚨 ACİL ÇAĞRI! 🚨\n\n${data.content}`);
+                        }
+                    });
+                });
+            }
+
+            // ================= SESLİ & GÖRÜNTÜLÜ ARAMA SİSTEMİ (JITSI) =================
+
+            // Canlı Aktif Arama İzleme
+            function listenActiveCall() {
+                onSnapshot(doc(db, "calls", "current"), (docSnap) => {
+                    const callAlert = document.getElementById('activeCallAlert');
+                    if (docSnap.exists()) {
+                        const data = docSnap.data();
+                        document.getElementById('callHostName').innerText = data.host;
+                        callAlert.classList.remove('hidden');
+                    } else {
+                        callAlert.classList.add('hidden');
+                    }
+                });
+            }
+
+            // Yeni Arama Başlat veya Mevcut Aramaya Katıl
+            window.startVideoCall = async () => {
+                if (checkBanStatus()) return;
+
+                const callDocRef = doc(db, "calls", "current");
+                const docSnap = await getDoc(callDocRef);
+
+                let roomName = "";
+                if (docSnap.exists()) {
+                    roomName = docSnap.data().roomName;
+                } else {
+                    roomName = "GRoom_Call_" + Math.random().toString(36).substring(2, 9);
+                    await setDoc(callDocRef, {
+                        roomName: roomName,
+                        host: currentUser,
+                        timestamp: Date.now()
+                    });
+                }
+
+                openJitsiFrame(roomName);
+            };
+
+            // Jitsi Arama Arayüzünü Aç
+            function openJitsiFrame(roomName) {
+                const container = document.getElementById('jitsiContainer');
+                container.classList.remove('hidden');
+                document.getElementById('jitsiMeetArea').innerHTML = '';
+
+                const domain = "meet.jit.si";
+                const options = {
+                    roomName: roomName,
+                    width: "100%",
+                    height: "100%",
+                    parentNode: document.getElementById('jitsiMeetArea'),
+                    userInfo: {
+                        displayName: currentUser
+                    },
+                    interfaceConfigOverwrite: {
+                        MOBILE_APP_PROMO: false
+                    },
+                    configOverwrite: {
+                        startWithAudioMuted: false,
+                        startWithVideoMuted: false
+                    }
+                };
+                
+                jitsiApi = new JitsiMeetExternalAPI(domain, options);
+
+                jitsiApi.addEventListener('videoConferenceLeft', () => {
+                    closeVideoCall(false);
+                });
+            }
+
+            // Aramayı Kapat
+            window.closeVideoCall = async (forceCloseDoc = false) => {
+                if (jitsiApi) {
+                    jitsiApi.dispose();
+                    jitsiApi = null;
+                }
+                document.getElementById('jitsiContainer').classList.add('hidden');
+                document.getElementById('jitsiMeetArea').innerHTML = '';
+
+                if (forceCloseDoc) {
+                    await deleteDoc(doc(db, "calls", "current"));
+                }
+            };
+
+            // Dosya Seçme
+            window.triggerFileInput = (type) => {
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = type === 'video' ? 'video/*' : 'image/*';
+                input.onchange = (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+
+                    const reader = new FileReader();
+                    reader.onload = function (event) {
+                        const fileData = event.target.result;
+
+                        if (type === 'video') {
+                            const videoEl = document.createElement('video');
+                            videoEl.src = fileData;
+                            videoEl.onloadedmetadata = function() {
+                                if (videoEl.duration > 5.5) {
+                                    alert("Yüklediğiniz video 5 saniyeden uzun olamaz!");
+                                } else {
+                                    sendMessage('video', fileData);
+                                }
+                            };
+                        } else {
+                            sendMessage(type, fileData);
+                        }
+                    };
+                    reader.readAsDataURL(file);
+                };
+                input.click();
+            };
+
+            // Modalları Aç/Kapat
+            window.toggleModal = (modalId, show) => {
+                const modal = document.getElementById(modalId);
+                show ? modal.classList.remove('hidden') : modal.classList.add('hidden');
+            };
+
+            // AD DEĞİŞTİRME
+            window.changeUsername = async () => {
+                const newName = document.getElementById('newUsernameInput').value.trim();
+                if (!newName) return alert("Lütfen geçerli bir isim girin!");
+
+                try {
+                    const userDoc = await getDoc(doc(db, "active_users", newName));
+                    if (userDoc.exists() && newName !== currentUser) {
+                        return alert("Bu isim şu an kullanımda!");
+                    }
+
+                    if (currentUser) {
+                        await deleteDoc(doc(db, "active_users", currentUser));
+                    }
+                    await setDoc(doc(db, "active_users", newName), { active: true });
+
+                    localStorage.setItem('groom_username', newName);
+                    currentUser = newName;
+
+                    alert(`Kullanıcı adınız başarıyla '${newName}' olarak değiştirildi!`);
+                    toggleModal('settingsModal', false);
+                    location.reload();
+                } catch (err) {
+                    console.error("Ad değiştirme hatası:", err);
+                    alert("Ad değiştirilemedi!");
+                }
+            };
+
+            // Yönetici Şifresi Girişi (GRoom6000)
+            window.checkAdminPassword = () => {
+                const pass = document.getElementById('adminPasswordInput').value;
+                if (pass === "GRoom6000") {
+                    adminModal.classList.remove('hidden');
+                    settingsModal.classList.add('hidden');
+                    document.getElementById('adminPasswordInput').value = '';
+                } else {
+                    alert("Hatalı şifre!");
+                }
+            };
+
+            // Admin Kullanıcı Yasaklama
+            window.adminBan = async () => {
+                const target = document.getElementById('banTarget').value.trim();
+                const infinite = document.getElementById('banInfinite').checked;
+                const duration = parseInt(document.getElementById('banDuration').value) || 30;
+
+                if (!target) return alert("Kullanıcı adı girin!");
+
+                const expiry = infinite ? 'infinite' : (Date.now() + duration * 60 * 1000).toString();
+                await setDoc(doc(db, "bans", target), { expiry: expiry });
+                
+                alert(`${target} başarıyla banlandı!`);
+                document.getElementById('banTarget').value = '';
+            };
+
+            // Admin Ban Kaldırma
+            window.adminAntiBan = async () => {
+                const target = document.getElementById('antiBanTarget').value.trim();
+                if (!target) return alert("Kullanıcı adı girin!");
+
+                await deleteDoc(doc(db, "bans", target));
+                alert(`${target} adlı kullanıcının banı kaldırıldı!`);
+                document.getElementById('antiBanTarget').value = '';
+            };
+        });
+    </script>
+</head>
+<body class="bg-gray-900 text-white font-sans h-screen flex flex-col justify-between overflow-hidden">
+
+    <!-- HEADER -->
+    <header class="bg-gray-800 px-4 py-3 flex justify-between items-center border-b border-gray-700 shadow-md shrink-0">
+        <div class="flex items-center space-x-2">
+            <!-- Discord Çağrı Butonu -->
+            <button onclick="sendDiscordCall()" title="Sohbetteki Herkesi Discord'a Çağır!" class="bg-[#5865F2] hover:bg-[#4752C4] text-white p-2.5 rounded-xl transition flex items-center justify-center shadow-md">
+                <i class="fa-brands fa-discord text-lg"></i>
+            </button>
+            
+            <!-- Sesli & Görüntülü Konuşma Başlatma Butonu -->
+            <button onclick="startVideoCall()" title="Sesli ve Görüntülü Arama Başlat / Katıl" class="bg-emerald-600 hover:bg-emerald-500 text-white p-2.5 rounded-xl transition flex items-center justify-center mr-1 shadow-md animate-bounce">
+                <i class="fa-solid fa-phone text-lg"></i>
+            </button>
+
+            <div class="w-8 h-8 bg-green-500 rounded-full flex items-center justify-center font-bold text-lg text-white shadow-inner">G</div>
+            <h1 class="text-lg font-bold tracking-wider text-green-400">G Room <span class="text-[10px] text-gray-400 uppercase">Online</span></h1>
+        </div>
+        <button onclick="toggleModal('settingsModal', true)" class="bg-gray-700 hover:bg-gray-600 p-2 rounded-full transition">
+            <i class="fa-solid fa-gear text-base"></i>
+        </button>
+    </header>
+
+    <!-- AKTİF SESLİ & GÖRÜNTÜLÜ ARAMA BİLDİRİM BARI -->
+    <div id="activeCallAlert" onclick="startVideoCall()" class="bg-green-600 hover:bg-green-500 text-white text-center py-2.5 text-xs font-bold cursor-pointer hidden animate-pulse shrink-0 shadow-lg border-b border-green-700">
+        <i class="fa-solid fa-phone-volume mr-2 text-sm animate-bounce"></i> <span id="callHostName">Biri</span> Aktif Sesli & Görüntülü Konuşma Başlattı! Katılmak İçin Buraya Tıkla! 📞
+    </div>
+
+    <!-- ANLIK SES KAYIT BİLDİRİMİ -->
+    <div id="recordStatus" class="bg-red-600 text-white text-center py-2 text-xs font-semibold hidden animate-pulse shrink-0">
+        <i class="fa-solid fa-microphone mr-1"></i> Ses kaydediliyor... Durdurmak için mikrofona tekrar basın!
+    </div>
+
+    <!-- MESAJ AKIŞI -->
+    <main id="messages" class="flex-1 overflow-y-auto p-4 space-y-4 max-w-4xl w-full mx-auto pb-28">
+        <!-- Mesajlar buraya akacak -->
+    </main>
+
+    <!-- GÖRÜNTÜLÜ KONUŞMA PENCERESİ (FULLSCREEN MODAL) -->
+    <div id="jitsiContainer" class="fixed inset-0 bg-black/95 z-50 flex flex-col hidden">
+        <div class="bg-gray-800 p-4 flex justify-between items-center border-b border-gray-700 shrink-0">
+            <h3 class="font-bold text-green-400"><i class="fa-solid fa-video mr-2"></i> G Room Sesli & Görüntülü Konuşma</h3>
+            <div class="flex space-x-2">
+                <button onclick="closeVideoCall(true)" class="bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition">Aramayı Herkese Kapat</button>
+                <button onclick="closeVideoCall(false)" class="bg-gray-600 hover:bg-gray-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition">Aramadan Çık</button>
+            </div>
+        </div>
+        <div id="jitsiMeetArea" class="flex-1 w-full bg-gray-950">
+            <!-- Görüntülü konuşma ekranı buraya yüklenecek -->
+        </div>
+    </div>
+
+    <!-- FOOTER PANELİ -->
+    <footer class="fixed bottom-0 left-0 right-0 bg-gray-800 p-3 border-t border-gray-700 z-40 shrink-0">
+        <div class="max-w-4xl mx-auto flex items-center space-x-1.5">
+            <button onclick="triggerFileInput('image')" title="Fotoğraf" class="bg-blue-600 hover:bg-blue-500 p-2.5 rounded-lg transition text-sm">
+                <i class="fa-solid fa-image"></i>
+            </button>
+            <button onclick="triggerFileInput('image')" title="GIF" class="bg-purple-600 hover:bg-purple-500 p-2.5 rounded-lg transition text-sm">
+                <i class="fa-solid fa-face-smile"></i>
+            </button>
+            <button onclick="triggerFileInput('video')" title="Video" class="bg-pink-600 hover:bg-pink-500 p-2.5 rounded-lg transition text-sm">
+                <i class="fa-solid fa-video"></i>
+            </button>
+            
+            <!-- SESLİ MESAJ MİKROFON BUTONU -->
+            <button id="recordBtn" onclick="toggleAudioRecording()" title="Sesli Mesaj" class="bg-emerald-600 hover:bg-emerald-500 p-2.5 rounded-lg transition w-10 h-10 flex items-center justify-center text-white shrink-0">
+                <i class="fa-solid fa-microphone text-base"></i>
+            </button>
+            
+            <input id="messageInput" type="text" placeholder="Mesaj yazın..." class="flex-1 bg-gray-700 text-white px-3 py-2.5 text-sm rounded-lg outline-none border border-gray-600 focus:border-green-500 transition" onkeypress="if(event.key === 'Enter') sendMessage('text')">
+            
+            <button onclick="sendMessage('text')" class="bg-green-600 hover:bg-green-500 px-4 py-2.5 rounded-lg transition font-bold shrink-0 text-sm">
+                <i class="fa-solid fa-paper-plane"></i>
+            </button>
+        </div>
+    </footer>
+
+    <!-- GİRİŞ MODAL -->
+    <div id="loginModal" class="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50 hidden">
+        <div class="bg-gray-800 p-6 rounded-2xl w-full max-w-md border border-gray-700 shadow-2xl">
+            <h2 class="text-2xl font-bold text-center mb-6 text-green-400">G Room'a Hoş Geldin</h2>
+            <input id="usernameInput" type="text" placeholder="Kullanıcı Adınız" class="w-full bg-gray-700 border border-gray-600 rounded-xl px-4 py-3 mb-4 text-white outline-none focus:border-green-500">
+            <button onclick="joinChat()" class="w-full bg-green-600 hover:bg-green-500 text-white font-bold py-3 rounded-xl transition">Sohbete Başla</button>
+        </div>
+    </div>
+
+    <!-- AYARLAR MODAL -->
+    <div id="settingsModal" class="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50 hidden">
+        <div class="bg-gray-800 p-6 rounded-2xl w-full max-w-md border border-gray-700 shadow-2xl">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-xl font-bold">Ayarlar</h2>
+                <button onclick="toggleModal('settingsModal', false)"><i class="fa-solid fa-xmark text-lg hover:text-red-500"></i></button>
+            </div>
+            
+            <!-- Ad Değiştirme -->
+            <div class="mb-6">
+                <label class="block text-sm text-gray-400 mb-2">Kullanıcı Adı Değiştir</label>
+                <div class="flex space-x-2">
+                    <input id="newUsernameInput" type="text" placeholder="Yeni Kullanıcı Adı" class="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white outline-none">
+                    <button onclick="changeUsername()" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg transition">Değiştir</button>
+                </div>
+            </div>
+
+            <!-- Yönetici Girişi -->
+            <div class="border-t border-gray-700 pt-4">
+                <label class="block text-sm text-gray-400 mb-2">Yönetici Girişi</label>
+                <div class="flex space-x-2">
+                    <input id="adminPasswordInput" type="password" placeholder="Şifre" class="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white outline-none">
+                    <button onclick="checkAdminPassword()" class="bg-red-600 hover:bg-red-500 px-4 py-2 rounded-lg transition">Giriş Yap</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ADMİN PANEL MODAL -->
+    <div id="adminModal" class="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50 hidden">
+        <div class="bg-gray-800 p-6 rounded-2xl w-full max-w-md border border-gray-700 shadow-2xl">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-xl font-bold text-red-500">G Room Yönetici Paneli</h2>
+                <button onclick="toggleModal('adminModal', false)"><i class="fa-solid fa-xmark text-lg hover:text-red-500"></i></button>
+            </div>
+
+            <!-- Kullanıcı Banlama -->
+            <div class="mb-6 border-b border-gray-700 pb-6">
+                <h3 class="font-semibold mb-3 text-red-400">Kullanıcı Banla</h3>
+                <input id="banTarget" type="text" placeholder="Hedef Kullanıcı Adı" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 mb-3 text-white outline-none">
+                <div class="flex items-center space-x-3 mb-3">
+                    <input id="banDuration" type="number" placeholder="Süre (Dakika)" class="w-32 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white outline-none">
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input id="banInfinite" type="checkbox" class="w-4 h-4 rounded">
+                        <span>Sonsuz Ban</span>
+                    </label>
+                </div>
+                <button onclick="adminBan()" class="w-full bg-red-600 hover:bg-red-500 py-2 rounded-lg font-bold transition">Yasakla</button>
+            </div>
+
+            <!-- Anti Ban -->
+            <div>
+                <h3 class="font-semibold mb-3 text-green-400">Anti Ban (Yasak Kaldır)</h3>
+                <input id="antiBanTarget" type="text" placeholder="Kullanıcı Adı" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 mb-3 text-white outline-none">
+                <button onclick="adminAntiBan()" class="w-full bg-green-600 hover:bg-green-500 py-2 rounded-lg font-bold transition">Banı Kaldır</button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
