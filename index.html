@@ -55,6 +55,18 @@
             const recordBtn = document.getElementById('recordBtn');
             const recordStatus = document.getElementById('recordStatus');
 
+            // İlk Kurulum: Firebase'de koleksiyonların otomatik oluşmasını tetikler
+            async function initializeCollections() {
+                try {
+                    // "init" dokümanları ile koleksiyonların Firebase konsolunda görünmesini tetikliyoruz
+                    await setDoc(doc(db, "bans", "system_init"), { info: "Koleksiyon aktif" });
+                    await setDoc(doc(db, "active_users", "system_init"), { info: "Koleksiyon aktif" });
+                } catch (e) {
+                    console.log("Koleksiyon tetikleme atlandı veya yetki kısıtlı:", e);
+                }
+            }
+            initializeCollections();
+
             // Giriş Kontrolü
             if (!currentUser) {
                 loginModal.classList.remove('hidden');
@@ -92,20 +104,19 @@
                     startApp();
                 } catch (err) {
                     console.error("Giriş hatası:", err);
-                    alert("Veritabanı bağlantı hatası!");
+                    alert("Veritabanı bağlantı hatası veya yetki engeli!");
                 }
             };
 
             // Sekme kapanırken ismi havuzdan temizle
             window.addEventListener('beforeunload', () => {
                 if (currentUser) {
-                    // beacon veya asenkron silme tetiklemesi
                     const userRef = doc(db, "active_users", currentUser);
                     deleteDoc(userRef).catch(err => console.error(err));
                 }
             });
 
-            // Ban Durumu Kontrolü
+            // Ban Durumu Kontrolü (Hatalı/Eski banları temizler)
             function checkBanStatus() {
                 const banExpiry = localStorage.getItem('groom_ban_expiry');
                 if (banExpiry) {
@@ -114,11 +125,12 @@
                         return true;
                     }
                     const expiryTime = parseInt(banExpiry);
-                    if (Date.now() < expiryTime) {
+                    if (!isNaN(expiryTime) && Date.now() < expiryTime) {
                         const remaining = Math.round((expiryTime - Date.now()) / 1000 / 60);
                         showBanScreen(`Spam nedeniyle cezalandırıldınız! Kalan süre: ${remaining} dakika`);
                         return true;
                     } else {
+                        // Süre dolduysa veya geçersiz veriyse yerel depolamayı temizle
                         localStorage.removeItem('groom_ban_expiry');
                     }
                 }
@@ -132,11 +144,16 @@
                 activeBanListener = onSnapshot(doc(db, "bans", username), (docSnap) => {
                     if (docSnap.exists()) {
                         const banData = docSnap.data();
-                        localStorage.setItem('groom_ban_expiry', banData.expiry);
-                        checkBanStatus();
+                        if (banData && banData.expiry) {
+                            localStorage.setItem('groom_ban_expiry', banData.expiry);
+                            checkBanStatus();
+                        }
                     } else {
+                        // Firebase'de ban dokümanı yoksa lokal banı da kaldır ve uygulamayı devam ettir
                         localStorage.removeItem('groom_ban_expiry');
                     }
+                }, (error) => {
+                    console.log("Ban sorgulama atlandı (Henüz ban kaydı yoksa normaldir):", error.message);
                 });
             }
 
@@ -146,6 +163,7 @@
                         <i class="fa-solid fa-ban text-red-500 text-7xl mb-4 animate-pulse"></i>
                         <h1 class="text-3xl font-bold text-center">${message}</h1>
                         <p class="text-gray-400 mt-2">G Room Online kurallarına uymadığınız için işlem yapılmıştır.</p>
+                        <button onclick="localStorage.removeItem('groom_ban_expiry'); location.reload();" class="mt-6 bg-red-600 hover:bg-red-500 px-6 py-2.5 rounded-xl font-bold transition">Yeniden Bağlanmayı Dene</button>
                     </div>`;
             }
 
@@ -363,7 +381,6 @@
                 const meetArea = document.getElementById('jitsiMeetArea');
                 meetArea.innerHTML = '';
 
-                // Kütüphane yüklenmediyse uyar
                 if (typeof JitsiMeetExternalAPI === 'undefined') {
                     alert("Jitsi kütüphanesi yüklenemedi. Lütfen internet bağlantınızı veya AdBlock eklentilerinizi kontrol edin!");
                     container.classList.add('hidden');
@@ -391,7 +408,6 @@
                 
                 jitsiApi = new JitsiMeetExternalAPI(domain, options);
 
-                // Tarayıcıların iframe içinde kamera ve mikrofonu engellemesini önlemek için izinleri zorluyoruz
                 const iframe = meetArea.querySelector('iframe');
                 if (iframe) {
                     iframe.setAttribute('allow', 'camera; microphone; display-capture; autoplay; clipboard-write');
